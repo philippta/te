@@ -135,7 +135,7 @@ int editor_load_file(struct editor *editor, char *pathname) {
 }
 
 void format_line_number(char *buf, int buf_size, int num) {
-	for (int i = buf_size - 1; i >= 0; i--) {
+	for (int i = buf_size - 1; i >= 0 && num > 0; i--) {
 		buf[i] = (num % 10) + '0';
 		num = num / 10;
 	}
