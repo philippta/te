@@ -60,7 +60,7 @@ void tty_write(struct tty *tty, char *buf, int n) {
 	write(tty->fd_out, buf, n);
 }
 
-int tty_refresh_size(struct tty *tty) {
+int tty_resize(struct tty *tty) {
 	struct winsize ws;
 	if (ioctl(tty->fd_out, TIOCGWINSZ, &ws) == -1) {
 		return -1;
@@ -82,4 +82,24 @@ void tty_mode_alternate(struct tty *tty) {
 
 void tty_mode_normal(struct tty *tty) {
 	tty_write(tty, "\e[?1049l", 8);
+}
+
+void tty_cursor_hide(struct tty *tty) {
+	tty_write(tty, "\e[?25l", 6);
+}
+
+void tty_cursor_show(struct tty *tty) {
+	tty_write(tty, "\e[?25h", 6);
+}
+
+void tty_cursor_reset(struct tty *tty) {
+	tty_write(tty, "\e[1;1H", 6);
+}
+
+void tty_frame_start(struct tty *tty) {
+	write(tty->fd_out, "\e[?25l\e[1;1H", 12);
+}
+
+void tty_frame_end(struct tty *tty) {
+	write(tty->fd_out, "\e[1;1H\e[?25h", 12);
 }

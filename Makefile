@@ -1,2 +1,2 @@
 run:
-	clang -Wall -Wextra -o te te.c && ./te
+	clang -O3 -march=native -Wall -Wextra -o te te.c && ./te
