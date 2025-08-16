@@ -1,9 +1,11 @@
-#include "te_tty.c"
+#include "te.h"
+#include "rope.h"
+#include "tty.h"
+#include "util.h"
 
 #include <err.h>
 #include <fcntl.h>
 #include <mach/mach_time.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,277 +15,255 @@
 #include <termios.h>
 #include <unistd.h>
 
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
-
-void debug(const char *fmt, ...) {
-	FILE *f = fopen("debug.log", "a"); // "a" means append
-	if (!f)
-		return; // could also handle error more explicitly
-
-	va_list args;
-	va_start(args, fmt);
-	vfprintf(f, fmt, args);
-	va_end(args);
-
-	fclose(f);
-}
-
-#define BENCH_NS_N(N, code_block)                                            \
-	do {                                                                     \
-		mach_timebase_info_data_t _info;                                     \
-		mach_timebase_info(&_info);                                          \
-		uint64_t _start = mach_absolute_time();                              \
-		for (int _i = 0; _i < (N); _i++) {                                   \
-			code_block;                                                      \
-		}                                                                    \
-		uint64_t _end = mach_absolute_time();                                \
-		uint64_t _elapsed_ns = (_end - _start) * _info.numer / _info.denom;  \
-		debug("Benchmark (%d runs): total = %8llu ns, average = %8llu ns\n", \
-			  (N),                                                           \
-			  (unsigned long long)_elapsed_ns,                               \
-			  (unsigned long long)(_elapsed_ns / (N)));                      \
-	} while (0)
-
-enum mode {
-	mode_normal,
-	mode_insert,
-};
-
-struct editor {
-	struct tty tty;
-
-	char *text_buf;
-	int text_buf_size;
-
-	char *file_buf;
-	int file_buf_size;
-	int file_line_count;
-	int file_line_digits;
-
-	enum mode mode;
-
-	int cursor_x;
-	int cursor_y;
-};
-
-struct bounds {
-	int x, y, h, w;
-};
-
 struct editor *editor = NULL;
 
-int memcnt(char *buf, int size, char c) {
-	int count = 0;
-	char *p;
-	while ((p = memchr(buf, c, size)) != NULL) {
-		buf = p + 1;
-		size -= (p - buf) + 1;
-		count++;
-	}
-	return count;
-}
+// void editor_resize(struct editor *editor) { tty_resize(&editor->tty); }
 
-void editor_resize(struct editor *editor) {
-	tty_resize(&editor->tty);
-}
-
-int editor_init(struct editor *editor) {
-	if (tty_open(&editor->tty) != 0) {
+int editor_init(struct editor *editor)
+{
+	editor->tty = tty_open(&editor->termios_orig);
+	if (editor->tty == -1) {
 		return -1;
 	}
 
-	tty_mode_alternate(&editor->tty);
+	if (tty_get_window_size(editor->tty, &editor->window_rows, &editor->window_cols) == -1) {
+		return -1;
+	};
+
+	editor->screen	    = realloc(editor->screen, editor->window_rows * editor->window_cols);
+	editor->screen_size = editor->window_rows * editor->window_cols;
+	editor->rope	    = rope_new();
+
+	write(editor->tty, TTY_ALT_MODE);
 
 	return 0;
 }
 
-int editor_load_file(struct editor *editor, char *pathname) {
+int editor_load_file(struct editor *editor, char *pathname)
+{
 	struct stat st;
 	if (stat(pathname, &st) != 0) {
 		return -1;
 	}
 
-	puts(pathname);
-	int f = open(pathname, O_RDONLY);
-	if (f == -1) {
+	int fd = open(pathname, O_RDONLY);
+	if (fd == -1) {
 		return -1;
 	}
 
-	if (editor->file_buf == NULL || editor->file_buf_size != st.st_size) {
-		editor->file_buf = malloc(st.st_size);
-		editor->file_buf_size = st.st_size;
-	} else {
-		editor->file_buf = realloc(editor->file_buf, st.st_size);
-		editor->file_buf_size = st.st_size;
+	char *file_buf = malloc(st.st_size + 1);
+	if (file_buf == NULL) {
+		close(fd);
+		return -1;
 	}
+	file_buf[st.st_size] = 0; // null terminator
 
-	if (read(f, editor->file_buf, editor->file_buf_size) != editor->file_buf_size) {
+	if (read(fd, file_buf, st.st_size) != st.st_size) {
+		close(fd);
 		return -1;
 	}
 
-	if (close(f) != 0) {
-		return -1;
-	}
+	rope_insert(editor->rope, 0, (uint8_t *)file_buf);
 
-	editor->file_line_count = memcnt(editor->file_buf, editor->file_buf_size, '\n');
-	editor->file_line_digits = 0;
-	for (int i = editor->file_line_count; i != 0; i /= 10)
-		editor->file_line_digits++;
-
+	free(file_buf);
+	close(fd);
 	return 0;
 }
 
-void format_line_number(char *buf, int buf_size, int num) {
-	for (int i = buf_size - 1; i >= 0 && num > 0; i--) {
-		buf[i] = (num % 10) + '0';
-		num = num / 10;
+void editor_render_line_numbers_in_bounds(struct editor *editor, int start, struct bounds bounds)
+{
+	char buf[bounds.w];
+	memset(buf, ' ', bounds.w);
+
+	for (int i = 0; i < bounds.h; i++) {
+		format_line_number(buf, bounds.w, start + i);
+
+		int screen_ofs = (i + bounds.y) * editor->window_cols + bounds.x;
+		memcpy(editor->screen + screen_ofs, buf, bounds.w);
 	}
 }
 
-void editor_text_render(struct editor *editor, struct bounds bounds) {
-	char *file = editor->file_buf;
-	int offset = 0;
-	int cols = editor->tty.cols;
-	int ln_size = editor->file_line_digits;
-	char ln_buf[ln_size];
+void editor_render_text_in_bounds(struct editor *editor, char *input, int input_len, struct bounds bounds)
+{
+	char *input_end	  = input + input_len;
+	int   current_row = 0;
 
-	memset(ln_buf, ' ', ln_size);
+	while (input < input_end && current_row < bounds.h) {
+		char *next_line	 = memchr(input, '\n', input_end - input);
+		int   screen_ofs = (current_row + bounds.y) * editor->window_cols + bounds.x;
 
-	for (int i = 0; offset < editor->file_buf_size && i < bounds.h; i++) {
-		format_line_number(ln_buf, editor->file_line_digits, i + 1);
+		if (screen_ofs > editor->screen_size) {
+			break;
+		}
 
-		char *text = file + offset;
-		char *text_end = memchr(text, '\n', editor->file_buf_size - offset);
-		int text_len = text_end - text;
+		memcpy(editor->screen + screen_ofs, input, MIN(bounds.w, next_line - input));
 
-		memcpy(editor->text_buf + ((i + bounds.y) * cols) + bounds.x, ln_buf, MIN(bounds.w, ln_size));
-		memcpy(editor->text_buf + ((i + bounds.y) * cols) + bounds.x + ln_size + 1, text, MIN(bounds.w - ln_size - 1, text_len));
-
-		offset += (text_end - text) + 1;
+		input	    = next_line + 1;
+		current_row = current_row + 1;
 	}
 }
 
-void editor_status_render(struct editor *editor, struct bounds bounds) {
-	int cols = editor->tty.cols;
-	memcpy(editor->text_buf + (bounds.y * cols), "dummyfile.txt", MIN(bounds.w, 13));
+// void editor_status_render(struct editor *editor, struct bounds bounds)
+// {
+// 	int cols = editor->tty.cols;
+// 	memcpy(editor->screen_chars + (bounds.y * cols), "dummyfile.txt",
+// 	       MIN(bounds.w, 13));
+//
+// 	switch (editor->mode) {
+// 	case mode_normal:
+// 		memcpy(editor->screen_chars + (bounds.y * cols) +
+// 			   (bounds.w - 6),
+// 		       "NORMAL", MIN(bounds.w, 6));
+// 		break;
+// 	case mode_insert:
+// 		memcpy(editor->screen_chars + (bounds.y * cols) +
+// 			   (bounds.w - 6),
+// 		       "INSERT", MIN(bounds.w, 6));
+// 		break;
+// 	}
+// }
+//
 
-	switch (editor->mode) {
-	case mode_normal:
-		memcpy(editor->text_buf + (bounds.y * cols) + (bounds.w - 6), "NORMAL", MIN(bounds.w, 6));
-		break;
-	case mode_insert:
-		memcpy(editor->text_buf + (bounds.y * cols) + (bounds.w - 6), "INSERT", MIN(bounds.w, 6));
-		break;
+int editor_render(struct editor *editor)
+{
+	// BENCH(1000, {
+	//
+	//
+	//
+	debug("render 1\n");
+	size_t text_len = rope_char_count(editor->rope);
+	char  *text	= (char *)rope_create_cstr(editor->rope);
+	if (text == NULL) {
+		return -1;
 	}
-}
+	debug("render 2, %p, %d\n", text, text_len);
 
-void editor_cursor_update(struct editor *editor) {
-	editor->cursor_x = MAX(1, MIN(editor->cursor_x, editor->tty.cols));
-	editor->cursor_y = MAX(1, MIN(editor->cursor_y, editor->tty.rows));
+	// int text_lines	      = memcnt(text, '\n', text_len);
+	// int text_lines_digits = digits(text_lines);
+	// text_lines_digits = -1;
+	debug("render 3\n");
 
-	char buf[16] = {};
-	snprintf(buf, sizeof(buf) - 1, "\e[%d;%dH", editor->cursor_y, editor->cursor_x);
+	struct bounds text_bounds;
+	// text_bounds.x = text_lines_digits + 1;
+	text_bounds.x = 0;
+	text_bounds.y = 0;
+	// text_bounds.h = MIN(text_lines, editor->window_rows - 2); // (-status, -command)
+	text_bounds.h = editor->window_rows; // (-status, -command)
+	text_bounds.w = editor->window_cols - 3;
+	debug("render 4\n");
 
-	tty_write(&editor->tty, buf, strlen(buf));
-}
+	// struct bounds line_number_bounds;
+	// line_number_bounds.x = MAX(text_bounds.x - text_lines_digits - 1, 0);
+	// line_number_bounds.y = text_bounds.y;
+	// line_number_bounds.h = text_bounds.h;
+	// line_number_bounds.w = text_lines_digits;
+	memset(editor->screen, ' ', editor->screen_size);
+	editor_render_text_in_bounds(editor, text, text_len, text_bounds);
+	// editor_render_line_numbers_in_bounds(editor, 1, line_number_bounds);
+	debug("render 5\n");
 
-int editor_render(struct editor *editor, char bg) {
-	if (editor->text_buf == NULL) {
-		editor->text_buf = malloc(editor->tty.cols * editor->tty.rows);
-		editor->text_buf_size = editor->tty.cols * editor->tty.rows;
-	} else if (editor->text_buf_size != editor->tty.cols * editor->tty.rows) {
-		editor->text_buf = realloc(editor->text_buf, editor->tty.cols * editor->tty.rows);
-		editor->text_buf_size = editor->tty.cols * editor->tty.rows;
-	}
+	free(text);
+	// });
 
-	memset(editor->text_buf, bg == 0 ? ' ' : bg, editor->text_buf_size);
+	write(editor->tty, TTY_FRAME_START);
+	write(editor->tty, editor->screen, editor->screen_size);
+	debug("render 6\n");
 
-	struct bounds text_bounds = {
-		.x = 0,
-		.y = 0,
-		.h = editor->tty.rows - 2, // (-status, -command)
-		.w = editor->tty.cols,
-	};
+	editor_set_cursor_position(editor);
 
-	struct bounds status_bounds = {
-		.x = 0,
-		.y = editor->tty.rows - 2,
-		.h = 1,
-		.w = editor->tty.cols,
-	};
-
-	editor_text_render(editor, text_bounds);
-	editor_status_render(editor, status_bounds);
-
-	tty_frame_start(&editor->tty);
-	tty_write(&editor->tty, editor->text_buf, editor->text_buf_size);
-	editor_cursor_update(editor);
-	tty_cursor_show(&editor->tty);
-
+	debug("render 7\n");
 	return 0;
 }
 
-void editor_close(struct editor *editor) {
+void editor_set_cursor_position(struct editor *editor)
+{
+	editor->cursor_row = MAX(0, MIN(editor->cursor_row, editor->window_rows - 1));
+	editor->cursor_col = MAX(0, MIN(editor->cursor_col, editor->window_cols - 1));
+
+	char buf[20] = {};
+	snprintf(buf, sizeof(buf) - 1, "\e[%d;%dH\e[?25h", editor->cursor_row + 1, editor->cursor_col + 1);
+	debug("CURSOR: row:%d col:%d\n", editor->cursor_row, editor->cursor_col);
+
+	write(editor->tty, buf, strlen(buf));
+}
+
+int editor_close(struct editor *editor)
+{
 	if (editor->file_buf != NULL) {
 		free(editor->file_buf);
 	}
-	if (editor->text_buf != NULL) {
-		free(editor->text_buf);
+	if (editor->screen != NULL) {
+		free(editor->screen);
 	}
 
-	tty_mode_normal(&editor->tty);
-	tty_close(&editor->tty);
+	write(editor->tty, TTY_NORM_MODE);
+	tty_close(editor->tty, &editor->termios_orig);
 	free(editor);
-}
-void handle_resize(int _) {
-	editor_resize(editor);
+
+	return 0;
 }
 
-int main(void) {
+int main(void)
+{
+	// signal(SIGWINCH, handle_resize);
+	// handle_resize(0);
+	//
 	editor = calloc(1, sizeof(struct editor));
 	if (editor_init(editor) != 0) {
-		err(EXIT_FAILURE, "Failed to init editor");
+		perror("Failed to init editor");
+		return -1;
 	}
-
-	signal(SIGWINCH, handle_resize);
-	handle_resize(0);
 
 	if (editor_load_file(editor, "dummyfile.txt") != 0) {
-		err(EXIT_FAILURE, "Failed to load file");
+		perror("Failed to load file");
+		return -1;
 	}
 
-	if (editor_render(editor, 0) != 0) {
-		err(EXIT_FAILURE, "Failed to draw");
+	if (editor_render(editor) != 0) {
+		perror("Failed to render");
+		return -1;
 	}
 
-	unsigned char c;
 	for (;;) {
-		c = tty_read_char(&editor->tty);
-		int exit = 0;
+		char c;
+		if (read(editor->tty, &c, 1) != 1) {
+			perror("Failed to read input");
+			return -1;
+		}
+
+		bool should_exit = 0;
 		switch (c) {
+		case 'a':
+			rope_insert(editor->rope, editor->cursor_col, (uint8_t *)"A");
+			break;
+		case 'x':
+			rope_del(editor->rope, editor->cursor_col, 1);
+			break;
 		case 'h':
-			editor->cursor_x--;
+			editor->cursor_col--;
 			break;
 		case 'l':
-			editor->cursor_x++;
+			editor->cursor_col++;
 			break;
 		case 'j':
-			editor->cursor_y++;
+			editor->cursor_row++;
 			break;
 		case 'k':
-			editor->cursor_y--;
+			editor->cursor_row--;
 			break;
 		case 3:
-			exit = 1;
+			should_exit = true;
 			break;
 		}
 
-		if (exit) {
+		if (should_exit) {
 			break;
 		}
 
-		BENCH_NS_N(1, { editor_render(editor, 0); });
+		if (editor_render(editor) != 0) {
+			perror("Failed to render");
+			return -1;
+		}
 	}
 
 	editor_close(editor);
