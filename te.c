@@ -130,18 +130,15 @@ int editor_render(struct editor *editor)
 	//
 	//
 	//
-	debug("render 1\n");
 	size_t text_len = rope_char_count(editor->rope);
 	char  *text	= (char *)rope_create_cstr(editor->rope);
 	if (text == NULL) {
 		return -1;
 	}
-	debug("render 2, %p, %d\n", text, text_len);
 
 	// int text_lines	      = memcnt(text, '\n', text_len);
 	// int text_lines_digits = digits(text_lines);
 	// text_lines_digits = -1;
-	debug("render 3\n");
 
 	struct bounds text_bounds;
 	// text_bounds.x = text_lines_digits + 1;
@@ -150,7 +147,6 @@ int editor_render(struct editor *editor)
 	// text_bounds.h = MIN(text_lines, editor->window_rows - 2); // (-status, -command)
 	text_bounds.h = editor->window_rows; // (-status, -command)
 	text_bounds.w = editor->window_cols - 3;
-	debug("render 4\n");
 
 	// struct bounds line_number_bounds;
 	// line_number_bounds.x = MAX(text_bounds.x - text_lines_digits - 1, 0);
@@ -160,18 +156,15 @@ int editor_render(struct editor *editor)
 	memset(editor->screen, ' ', editor->screen_size);
 	editor_render_text_in_bounds(editor, text, text_len, text_bounds);
 	// editor_render_line_numbers_in_bounds(editor, 1, line_number_bounds);
-	debug("render 5\n");
 
 	free(text);
 	// });
 
 	write(editor->tty, TTY_FRAME_START);
 	write(editor->tty, editor->screen, editor->screen_size);
-	debug("render 6\n");
 
 	editor_set_cursor_position(editor);
 
-	debug("render 7\n");
 	return 0;
 }
 
@@ -182,7 +175,6 @@ void editor_set_cursor_position(struct editor *editor)
 
 	char buf[20] = {};
 	snprintf(buf, sizeof(buf) - 1, "\e[%d;%dH\e[?25h", editor->cursor_row + 1, editor->cursor_col + 1);
-	debug("CURSOR: row:%d col:%d\n", editor->cursor_row, editor->cursor_col);
 
 	write(editor->tty, buf, strlen(buf));
 }
@@ -219,10 +211,12 @@ int main(void)
 		return -1;
 	}
 
-	if (editor_render(editor) != 0) {
-		perror("Failed to render");
-		return -1;
-	}
+	BENCH(1000, {
+		if (editor_render(editor) != 0) {
+			perror("Failed to render");
+			return -1;
+		}
+	});
 
 	for (;;) {
 		char c;
