@@ -129,7 +129,10 @@ int terminal_get_window_size(struct terminal_config *term, int *rows, int *cols)
 }
 
 struct bounds {
-	int x, y, w, h;
+	int row;
+	int col;
+	int width;
+	int height;
 };
 
 struct render_context {
@@ -138,23 +141,9 @@ struct render_context {
 	int   cols;
 };
 
-struct display_buffer {
-	char *cells;
-	int   rows;
-	int   cols;
-};
-
-void display_buffer_cleanup(struct display_buffer *display)
-{
-	if (display->cells != NULL) {
-		free(display->cells);
-	}
-}
-
 int  render_context_init(struct render_context *ctx, int rows, int cols);
 void render_context_clear(struct render_context *ctx);
 int  render_context_render(struct render_context *ctx, int fd);
-int  render_context_write_display_buffer(struct render_context *ctx, struct display_buffer *display, int row, int col);
 void render_context_cleanup(struct render_context *ctx);
 
 int render_context_init(struct render_context *ctx, int rows, int cols)
@@ -174,34 +163,6 @@ void render_context_clear(struct render_context *ctx)
 		return;
 	}
 	memset(ctx->screen_buffer, ' ', ctx->rows * ctx->cols);
-}
-
-int render_context_write_display_buffer(struct render_context *ctx, struct display_buffer *display, int row, int col)
-{
-	for (int r = 0; r < display->rows; r++) {
-		int screen_row = row + r;
-
-		// Skip rows that are outside the screen bounds
-		if (screen_row < 0 || screen_row >= ctx->rows) {
-			continue;
-		}
-
-		for (int c = 0; c < display->cols; c++) {
-			int screen_col = col + c;
-
-			// Skip columns that are outside the screen bounds
-			if (screen_col < 0 || screen_col >= ctx->cols) {
-				continue;
-			}
-
-			int display_idx = r * display->cols + c;
-			int screen_idx	= screen_row * ctx->cols + screen_col;
-
-			ctx->screen_buffer[screen_idx] = display->cells[display_idx];
-		}
-	}
-
-	return 0;
 }
 
 int render_context_render(struct render_context *ctx, int fd)
@@ -232,7 +193,6 @@ struct file_buffer {
 
 int  file_buffer_init_from_file(struct file_buffer *file, char *pathname);
 void file_buffer_get_str(struct file_buffer *file, char **str, int *str_len);
-void file_buffer_to_display_buffer(struct file_buffer *file, struct display_buffer *display, int rows, int cols);
 void file_buffer_cleanup(struct file_buffer *file);
 
 int file_buffer_init_from_file(struct file_buffer *file, char *pathname)
@@ -280,34 +240,57 @@ void file_buffer_get_str(struct file_buffer *file, char **str, int *str_len)
 	*str	 = (char *)rope_create_cstr(file->rope);
 }
 
-void file_buffer_to_display_buffer(struct file_buffer *file, struct display_buffer *display, int rows, int cols)
+void file_buffer_render_to_context(struct file_buffer *file, struct render_context *ctx, struct bounds *bounds)
 {
-	display->cells = malloc(cols * rows);
-	memset(display->cells, ' ', cols * rows);
-
-	display->rows = rows;
-	display->cols = cols;
-
 	int   str_len = rope_byte_count(file->rope);
 	char *str     = (char *)rope_create_cstr(file->rope);
 	int   str_ofs = 0;
 
-	for (int row = 0; row < rows && str_ofs < str_len; row++) {
+	for (int row = 0; row < bounds->height && str_ofs < str_len; row++) {
+		int screen_row = bounds->row + row;
+
+		// Skip rows that are outside the screen bounds
+		if (screen_row < 0 || screen_row >= ctx->rows) {
+			// Still need to advance through the string for this row
+			while (str_ofs < str_len && str[str_ofs] != '\n') {
+				str_ofs++;
+			}
+			if (str_ofs < str_len && str[str_ofs] == '\n') {
+				str_ofs++; // consume newline
+			}
+			continue;
+		}
+
 		bool found_newline = false;
-		for (int col = 0; col < cols && str_ofs < str_len; col++) {
+		for (int col = 0; col < bounds->width && str_ofs < str_len; col++) {
+			int screen_col = bounds->col + col;
+
+			// Skip columns that are outside the screen bounds
+			if (screen_col < 0 || screen_col >= ctx->cols) {
+				if (!found_newline) {
+					char c = str[str_ofs];
+					if (c == '\n') {
+						found_newline = true;
+					}
+					str_ofs++;
+				}
+				continue;
+			}
+
 			if (!found_newline) {
 				char c = str[str_ofs];
 				if (c == '\n') {
 					found_newline = true;
 					str_ofs++; // consume the newline
-						   // rest of row stays as spaces (from memset)
+					// rest of row in bounds will be whatever was already in screen_buffer
 				}
 				else {
-					display->cells[row * cols + col] = c;
+					int screen_idx		       = screen_row * ctx->cols + screen_col;
+					ctx->screen_buffer[screen_idx] = c;
 					str_ofs++;
 				}
 			}
-			// if found_newline is true, we just leave spaces for rest of row
+			// if found_newline is true, we leave whatever was already in screen_buffer
 		}
 	}
 
@@ -330,43 +313,87 @@ struct status_line {
 	int   cursor_col;
 };
 
-void status_line_to_display_buffer(struct status_line *sl, struct display_buffer *display, int cols)
+void status_line_render_to_context(struct status_line *sl, struct render_context *ctx, struct bounds *bounds)
 {
-	display->cells = malloc(cols);
-	memset(display->cells, ' ', cols);
+	// Only render if we have at least one row in the bounds
+	if (bounds->height < 1) {
+		return;
+	}
 
-	display->rows = 1;
-	display->cols = cols;
+	int screen_row = bounds->row;
+
+	// Skip if the status line row is outside screen bounds
+	if (screen_row < 0 || screen_row >= ctx->rows) {
+		return;
+	}
 
 	int offset = 0;
 
-	memcpy(display->cells + offset, sl->mode, MIN(cols - offset, sl->mode_len));
-	offset += MIN(cols - offset, sl->mode_len);
+	// Render mode
+	for (int i = 0; i < sl->mode_len && offset < bounds->width; i++) {
+		int screen_col = bounds->col + offset;
+		if (screen_col >= 0 && screen_col < ctx->cols) {
+			int screen_idx		       = screen_row * ctx->cols + screen_col;
+			ctx->screen_buffer[screen_idx] = sl->mode[i];
+		}
+		offset++;
+	}
 
-	// Space between mode and filename
+	// Space between mode and filename (4 spaces)
 	offset += 4;
 
-	memcpy(display->cells + offset, sl->file, MIN(cols - offset, sl->file_len));
-	offset += MIN(cols - offset, sl->file_len);
+	// Render filename
+	for (int i = 0; i < sl->file_len && offset < bounds->width; i++) {
+		int screen_col = bounds->col + offset;
+		if (screen_col >= 0 && screen_col < ctx->cols) {
+			int screen_idx		       = screen_row * ctx->cols + screen_col;
+			ctx->screen_buffer[screen_idx] = sl->file[i];
+		}
+		offset++;
+	}
 
+	// Prepare cursor position string
 	char str[32] = {};
 	int  str_len = snprintf(str, sizeof(str), "%d,%d", sl->cursor_row, sl->cursor_col);
 
-	// Right align cursor position
-	offset = cols - str_len;
+	// Right align cursor position within the bounds
+	offset = bounds->width - str_len;
 	if (offset < 0) {
 		offset = 0;
 	}
 
-	memcpy(display->cells + offset, str, MIN(cols - offset, str_len));
-	offset += MIN(cols - offset, str_len);
+	// Render cursor position
+	for (int i = 0; i < str_len && offset < bounds->width; i++) {
+		int screen_col = bounds->col + offset;
+		if (screen_col >= 0 && screen_col < ctx->cols) {
+			int screen_idx		       = screen_row * ctx->cols + screen_col;
+			ctx->screen_buffer[screen_idx] = str[i];
+		}
+		offset++;
+	}
+}
+
+struct editor_state {
+	int cursor_row;
+	int cursor_col;
+};
+
+int editor_state_place_cursor(struct editor_state *state, int fd)
+{
+	char buf[32] = {};
+	int  buf_len = snprintf(buf, sizeof(buf), "\e[%d;%dH", state->cursor_row + 1, state->cursor_col + 1);
+	if (write(fd, buf, buf_len) == -1) {
+		return -1;
+	}
+	return 0;
 }
 
 int main(void)
 {
-	struct terminal_config term	   = {};
-	struct render_context  render_ctx  = {};
-	struct file_buffer     file_buffer = {};
+	struct terminal_config term	    = {};
+	struct render_context  render_ctx   = {};
+	struct file_buffer     file_buffer  = {};
+	struct editor_state    editor_state = {};
 
 	if (terminal_init(&term) == -1) {
 		err(EXIT_FAILURE, "terminal init");
@@ -385,31 +412,65 @@ int main(void)
 
 	render_context_clear(&render_ctx);
 
-	struct display_buffer file_display = {};
-	file_buffer_to_display_buffer(&file_buffer, &file_display, term.window_rows - 2, term.window_cols);
-	render_context_write_display_buffer(&render_ctx, &file_display, 0, 0);
+	struct bounds file_buffer_bounds;
+	file_buffer_bounds.col	  = 0;
+	file_buffer_bounds.row	  = 0;
+	file_buffer_bounds.width  = term.window_cols;
+	file_buffer_bounds.height = term.window_rows - 2;
 
-	struct status_line status_line = {
-	    .mode	= "NORMAL",
-	    .mode_len	= 6,
-	    .file	= "foo.c",
-	    .file_len	= 5,
-	    .cursor_row = 10,
-	    .cursor_col = 50,
+	file_buffer_render_to_context(&file_buffer, &render_ctx, &file_buffer_bounds);
 
-	};
+	struct bounds status_line_bounds;
+	status_line_bounds.col	  = 0;
+	status_line_bounds.row	  = term.window_rows - 2;
+	status_line_bounds.width  = term.window_cols;
+	status_line_bounds.height = 1;
 
-	struct display_buffer status_line_display = {};
-	status_line_to_display_buffer(&status_line, &status_line_display, term.window_cols);
-	render_context_write_display_buffer(&render_ctx, &status_line_display, term.window_rows - 2, 0);
+	struct status_line status_line;
+	status_line.mode       = "NORMAL";
+	status_line.mode_len   = 6;
+	status_line.file       = "foo.c";
+	status_line.file_len   = 5;
+	status_line.cursor_row = 10;
+	status_line.cursor_col = 50;
 
+	status_line_render_to_context(&status_line, &render_ctx, &status_line_bounds);
 	render_context_render(&render_ctx, term.fd);
 
-	display_buffer_cleanup(&file_display);
-	display_buffer_cleanup(&status_line_display);
+	for (;;) {
+		char c;
+		if (read(term.fd, &c, 1) == -1) {
+			err(EXIT_FAILURE, "read input");
+		}
 
-	char c;
-	read(term.fd, &c, 1);
+		bool should_exit = false;
+
+		switch (c) {
+		case 'h':
+			editor_state.cursor_col = MAX(0, editor_state.cursor_col - 1);
+			editor_state_place_cursor(&editor_state, term.fd);
+			break;
+		case 'j':
+			editor_state.cursor_row = MIN(file_buffer_bounds.height - 1, editor_state.cursor_row + 1);
+			editor_state_place_cursor(&editor_state, term.fd);
+			break;
+		case 'k':
+			editor_state.cursor_row = MAX(0, editor_state.cursor_row - 1);
+			editor_state_place_cursor(&editor_state, term.fd);
+			break;
+		case 'l':
+			editor_state.cursor_col = MIN(file_buffer_bounds.width - 1, editor_state.cursor_col + 1);
+			editor_state_place_cursor(&editor_state, term.fd);
+			break;
+		case 'q':
+			should_exit = true;
+			break;
+		}
+
+		if (should_exit) {
+			break;
+		}
+	}
 
 	render_context_cleanup(&render_ctx);
 	terminal_cleanup(&term);
