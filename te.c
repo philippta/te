@@ -50,7 +50,6 @@ enum editor_mode {
 };
 
 struct editor_state {
-	int		 cursor_pos;
 	enum editor_mode mode;
 };
 
@@ -160,7 +159,7 @@ struct render_context {
 
 int  render_context_init(struct render_context *ctx, int rows, int cols);
 void render_context_clear(struct render_context *ctx);
-int  render_context_render(struct render_context *ctx, int fd);
+int  render_context_render(struct render_context *ctx, int fd, int cursor_col, int cursor_row);
 void render_context_cleanup(struct render_context *ctx);
 
 int render_context_init(struct render_context *ctx, int rows, int cols)
@@ -182,7 +181,7 @@ void render_context_clear(struct render_context *ctx)
 	memset(ctx->screen_buffer, ' ', ctx->rows * ctx->cols);
 }
 
-int render_context_render(struct render_context *ctx, int fd)
+int render_context_render(struct render_context *ctx, int fd, int cursor_row, int cursor_col)
 {
 	if (write(fd, TERMINAL_FRAME_START) == -1) {
 		return -1;
@@ -190,7 +189,12 @@ int render_context_render(struct render_context *ctx, int fd)
 	if (write(fd, ctx->screen_buffer, ctx->rows * ctx->cols) == -1) {
 		return -1;
 	}
-	if (write(fd, TERMINAL_FRAME_END) == -1) {
+	char buf[32] = {};
+	int  buf_len = snprintf(buf, sizeof(buf), "\e[%d;%dH", cursor_row + 1, cursor_col + 1);
+	if (write(fd, buf, buf_len) == -1) {
+		return -1;
+	}
+	if (write(fd, TERMINAL_CURSOR_SHOW) == -1) {
 		return -1;
 	}
 	return 0;
@@ -206,10 +210,16 @@ void render_context_cleanup(struct render_context *ctx)
 
 struct file_buffer {
 	rope *rope;
+	char *str;
+	int   str_len;
+	int   cursor_pos;
+	int   cursor_row;
+	int   cursor_col;
+
+	struct bounds bounds;
 };
 
 int  file_buffer_init_from_file(struct file_buffer *file, char *pathname);
-void file_buffer_get_str(struct file_buffer *file, char **str, int *str_len);
 void file_buffer_render_to_context(struct file_buffer *file, struct render_context *ctx, struct bounds *bounds);
 void file_buffer_cleanup(struct file_buffer *file);
 
@@ -252,10 +262,16 @@ int file_buffer_init_from_file(struct file_buffer *file, char *pathname)
 	return 0;
 }
 
-void file_buffer_get_str(struct file_buffer *file, char **str, int *str_len)
+void file_buffer_reload_str(struct file_buffer *file)
 {
-	*str_len = rope_char_count(file->rope);
-	*str	 = (char *)rope_create_cstr(file->rope);
+	file->str_len = rope_byte_count(file->rope);
+	file->str     = realloc(file->str, file->str_len + 1);
+	if (file->str == NULL) {
+		file->str_len = 0;
+	}
+	file->str[file->str_len] = 0;
+
+	rope_write_cstr(file->rope, (uint8_t *)file->str);
 }
 
 void file_buffer_render_to_context(struct file_buffer *file, struct render_context *ctx, struct bounds *bounds)
@@ -316,28 +332,91 @@ void file_buffer_render_to_context(struct file_buffer *file, struct render_conte
 	free(str);
 }
 
-void file_buffer_get_cursor_pos(struct file_buffer *file, int pos, int *row, int *col)
+void file_buffer_update_cursor_coords(struct file_buffer *file, struct bounds *bounds)
 {
-	char *str     = (char *)rope_create_cstr(file->rope);
-	int   str_len = rope_char_count(file->rope);
+	file->cursor_row = 0;
+	file->cursor_col = 0;
 
-	*row = 0;
-	*col = 0;
-
-	if (pos > str_len) {
-		free(str);
+	if (file->cursor_pos > file->str_len) {
 		return;
 	}
 
-	for (int i = 0; i < pos; i++) {
-		(*col)++;
-		if (str[i] == '\n') {
-			(*row)++;
-			*col = 0;
+	for (int i = 0; i < file->cursor_pos; i++) {
+		file->cursor_col++;
+		if (file->str[i] == '\n' || file->cursor_col % bounds->width == 0) {
+			file->cursor_row++;
+			file->cursor_col = 0;
 		}
 	}
+}
+void file_buffer_move_cursor_prev_line(struct file_buffer *file, struct bounds *bounds)
+{
+	// If we're at the beginning of the buffer, nothing to do
+	if (file->cursor_pos == 0) {
+		return;
+	}
 
-	free(str);
+	// Find the start of the current line
+	char *current_line_start = file->str + file->cursor_pos;
+	while (current_line_start > file->str && *(current_line_start - 1) != '\n') {
+		current_line_start--;
+	}
+
+	// If we're already at the first line, nothing to do
+	if (current_line_start == file->str) {
+		return;
+	}
+
+	// Find the start of the previous line
+	char *prev_line_start = current_line_start - 1; // Start from the '\n' before current line
+	while (prev_line_start > file->str && *(prev_line_start - 1) != '\n') {
+		prev_line_start--;
+	}
+
+	// Calculate the length of the previous line
+	int prev_line_len = (current_line_start - 1) - prev_line_start;
+
+	// Place cursor at the minimum of desired column and line length
+	int offset	 = (file->cursor_col < prev_line_len) ? file->cursor_col : prev_line_len;
+	file->cursor_pos = (prev_line_start - file->str) + offset;
+
+	file_buffer_update_cursor_coords(file, bounds);
+}
+
+void file_buffer_move_cursor_next_line(struct file_buffer *file, struct bounds *bounds)
+{
+	// Find the next newline
+	char *next_nl = memchr(file->str + file->cursor_pos, '\n', file->str_len - file->cursor_pos);
+	if (next_nl == NULL) {
+		return;
+	}
+
+	// Move to start of next line
+	int next_line_start = next_nl - file->str + 1;
+
+	// Find the end of the next line (or end of buffer)
+	char *line_end	    = memchr(file->str + next_line_start, '\n', file->str_len - next_line_start);
+	int   next_line_len = line_end ? (line_end - (file->str + next_line_start)) : (file->str_len - next_line_start);
+
+	// Place cursor at the minimum of desired column and line length
+	int offset	 = (file->cursor_col < next_line_len) ? file->cursor_col : next_line_len;
+	file->cursor_pos = next_line_start + offset;
+
+	file_buffer_update_cursor_coords(file, bounds);
+}
+
+void file_buffer_insert(struct file_buffer *file, char c)
+{
+	char str[2] = {c, 0};
+	rope_insert(file->rope, file->cursor_pos, (uint8_t *)str);
+	file->cursor_pos++;
+}
+
+void file_buffer_delete(struct file_buffer *file)
+{
+
+	file->cursor_pos--;
+	rope_del(file->rope, file->cursor_pos, 1);
 }
 
 void file_buffer_cleanup(struct file_buffer *file)
@@ -458,17 +537,13 @@ int main(void)
 	status_line.cursor_row = 10;
 	status_line.cursor_col = 50;
 
-	int row, col;
+	render_context_clear(&render_ctx);
+	file_buffer_reload_str(&file_buffer);
+	file_buffer_render_to_context(&file_buffer, &render_ctx, &file_buffer_bounds);
+	status_line_render_to_context(&status_line, &render_ctx, &status_line_bounds);
+	render_context_render(&render_ctx, term.fd, 0, 0);
 
 	for (;;) {
-		file_buffer_get_cursor_pos(&file_buffer, editor_state.cursor_pos, &row, &col);
-
-		render_context_clear(&render_ctx);
-		file_buffer_render_to_context(&file_buffer, &render_ctx, &file_buffer_bounds);
-		status_line_render_to_context(&status_line, &render_ctx, &status_line_bounds);
-		render_context_render(&render_ctx, term.fd);
-
-		terminal_place_cursor(&term, row, col);
 
 		char c;
 		if (read(term.fd, &c, 1) == -1) {
@@ -478,20 +553,26 @@ int main(void)
 		debug("keypress: %d\n", c);
 
 		bool should_exit = false;
-		int  char_count	 = rope_char_count(file_buffer.rope);
-		char str[2]	 = {c, 0};
 
 		if (editor_state.mode == EDITOR_MODE_NORMAL) {
 			switch (c) {
 			case 'h':
-				editor_state.cursor_pos = MAX(0, editor_state.cursor_pos - 1);
+				file_buffer.cursor_pos--;
+				file_buffer_update_cursor_coords(&file_buffer, &file_buffer_bounds);
+				terminal_place_cursor(&term, file_buffer.cursor_row, file_buffer.cursor_col);
 				break;
 			case 'j':
+				file_buffer_move_cursor_next_line(&file_buffer, &file_buffer_bounds);
+				terminal_place_cursor(&term, file_buffer.cursor_row, file_buffer.cursor_col);
 				break;
 			case 'k':
+				file_buffer_move_cursor_prev_line(&file_buffer, &file_buffer_bounds);
+				terminal_place_cursor(&term, file_buffer.cursor_row, file_buffer.cursor_col);
 				break;
 			case 'l':
-				editor_state.cursor_pos = MIN(char_count, editor_state.cursor_pos + 1);
+				file_buffer.cursor_pos++;
+				file_buffer_update_cursor_coords(&file_buffer, &file_buffer_bounds);
+				terminal_place_cursor(&term, file_buffer.cursor_row, file_buffer.cursor_col);
 				break;
 			case 'i':
 				editor_state.mode = EDITOR_MODE_INSERT;
@@ -509,12 +590,20 @@ int main(void)
 				write(term.fd, TERMINAL_CURSOR_BLOCK);
 				break;
 			case 127:
-				rope_del(file_buffer.rope, --editor_state.cursor_pos, 1);
+				file_buffer_delete(&file_buffer);
 				break;
 			default:
-				rope_insert(file_buffer.rope, editor_state.cursor_pos++, (uint8_t *)str);
+				file_buffer_insert(&file_buffer, c);
 				break;
 			}
+
+			file_buffer_reload_str(&file_buffer);
+			file_buffer_update_cursor_coords(&file_buffer, &file_buffer_bounds);
+
+			render_context_clear(&render_ctx);
+			file_buffer_render_to_context(&file_buffer, &render_ctx, &file_buffer_bounds);
+			status_line_render_to_context(&status_line, &render_ctx, &status_line_bounds);
+			render_context_render(&render_ctx, term.fd, file_buffer.cursor_row, file_buffer.cursor_col);
 		}
 
 		if (should_exit) {
